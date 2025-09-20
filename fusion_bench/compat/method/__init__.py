@@ -31,6 +31,13 @@ class AlgorithmFactory:
         "clip_post_defense_SAU": ".concrete_subspace.clip_post_defense.PostDefenseSAUAlgorithmForCLIP",
         "clip_safe_concrete_layer_wise_adamerging": ".concrete_subspace.clip_safe_concrete_adamerging.ConcreteSafeLayerWiseAdaMergingForCLIP",
         "clip_safe_concrete_task_wise_adamerging": ".concrete_subspace.clip_safe_concrete_adamerging.ConcreteSafeTaskWiseAdaMergingForCLIP",
+        "gpt2_layer_wise_adamerging": ".adamerging.gpt2_layer_wise_adamerging.GPT2LayerWiseAdaMergingAlgorithm",
+        "flan_t5_layer_wise_adamerging": ".adamerging.flan_t5_layer_wise_adamerging.FlanT5LayerWiseAdaMergingAlgorithm",
+        "clip_layer_wise_samerging": ".samerging.clip_layer_wise_samerging.CLIPLayerWiseSAMergingAlgorithm",
+        "clip_model_training_samerging": ".samerging.clip_model_training.CLIPModelTrainingSAMerging",
+        "clip_task_wise_samerging": ".samerging.clip_task_wise_samerging.CLIPTaskWiseSAMergingAlgorithm",
+        "gpt2_layer_wise_samerging": ".samerging.gpt2_layer_wise_samerging.GPT2LayerWiseSAMergingAlgorithm",
+        "flan_t5_layer_wise_samerging": ".samerging.flan_t5_layer_wise_samerging.FlanT5LayerWiseSAMergingAlgorithm",
         # model mixing methods
         "clip_weight_ensembling_moe": ".we_moe.clip_we_moe.CLIPWeightEnsemblingMoEAlgorithm",
         "sparse_clip_weight_ensembling_moe": "fusion_bench.method.SparseCLIPWeightEnsemblingMoEAlgorithm",

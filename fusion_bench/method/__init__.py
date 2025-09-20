@@ -8,6 +8,7 @@ _import_structure = {
     # --------------
     "base_algorithm": ["BaseModelFusionAlgorithm", "BaseAlgorithm"],
     "dummy": ["DummyAlgorithm"],
+    "single_task": ["SingleTaskAlgorithm"],
     # single task learning (fine-tuning)
     "classification": [
         "ImageClassificationFineTuningForCLIP",
@@ -47,6 +48,10 @@ _import_structure = {
         "GPT2LayerWiseAdaMergingAlgorithm",
         "LayerWiseAdaMergingForLlamaSFT",
         "FlanT5LayerWiseAdaMergingAlgorithm",
+    ],
+    "samerging": [
+        "CLIPLayerWiseSAMergingAlgorithm",
+        "GPT2LayerWiseSAMergingAlgorithm",
     ],
     "pwe_moe": [
         "PWEMoELinearScalarizationForCLIP",
@@ -130,12 +135,16 @@ if TYPE_CHECKING:
     from .depth_upscaling import DepthUpscalingAlgorithm, DepthUpscalingForLlama
     from .doge_ta import DOGE_TA_Algorithm
     from .dummy import DummyAlgorithm
+    from .single_task import SingleTaskAlgorithm
     from .ensemble import (
         MaxModelPredictorAlgorithm,
         SimpleEnsembleAlgorithm,
         WeightedEnsembleAlgorithm,
     )
-    from .fisher_merging import FisherMergingForCLIPVisionModel
+    from .fisher_merging import (
+        FisherMergingForCLIPVisionModel,
+        PermFisherMergingForCLIPVisionModel,
+    )
     from .isotropic_merging import (
         ISO_C_Merge,
         ISO_CTS_Merge,
@@ -188,6 +197,8 @@ if TYPE_CHECKING:
     from .task_arithmetic import TaskArithmeticAlgorithm
     from .task_singular_vector import TaskSingularVectorMerging
     from .ties_merging import TiesMergingAlgorithm
+    from .linearized_simple_average import LinearizedSimpleAverageAlgorithm
+    from .linearized_merging import LinearizedMergingAlgorithm
     from .we_moe import CLIPWeightEnsemblingMoEAlgorithm
     from .weighted_average import WeightedAverageAlgorithm, WeightedAverageForLLama
 

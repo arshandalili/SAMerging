@@ -70,6 +70,7 @@ class CLIPClassificationMixin(LightningFabricMixin):
         task: str,
         batch_size: Optional[int] = None,
         num_workers: Optional[int] = None,
+        max_steps: Optional[int] = None,
         **loader_kwargs,
     ):
         """
@@ -104,7 +105,7 @@ class CLIPClassificationMixin(LightningFabricMixin):
         # create the dataloader
         loader = DataLoader(clip_dataset, **dataloader_kwargs)
         loader = self.fabric.setup_dataloaders(loader)
-        return iter(InfiniteDataLoader(loader))
+        return iter(InfiniteDataLoader(loader, max_steps=max_steps))
 
     @torch.no_grad()
     def setup_zero_shot_classification_head(

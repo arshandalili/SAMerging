@@ -2,6 +2,7 @@ import itertools
 import json
 import logging
 import os
+import contextlib
 from pathlib import Path
 from typing import (  # noqa: F401
     TYPE_CHECKING,
@@ -206,6 +207,9 @@ class CLIPVisionModelTaskPool(
 
         self._is_setup = True
 
+    def _validate_batch(self, batch, task_name):
+        return True
+
     @torch.no_grad()
     def _evaluate(
         self,
@@ -244,29 +248,92 @@ class CLIPVisionModelTaskPool(
             leave=False,
             dynamic_ncols=True,
         )
-        for batch in pbar:
-            inputs, targets = batch
-            outputs = classifier(
-                inputs,
-                return_image_embeds=True,
-                return_dict=True,
-                task_name=task_name,
-            )
-            logits: Tensor = outputs["logits"]
 
-            loss = F.cross_entropy(logits, targets)
-            loss_metric.update(loss.detach().cpu())
-            acc = accuracy(logits.detach().cpu(), targets.detach().cpu())
-            pbar.set_postfix(
-                {
-                    "accuracy": accuracy.compute().item(),
-                    "loss": loss_metric.compute().item(),
-                }
+        processed_batches = 0
+        skipped_batches = 0
+
+        # Create an iterator to handle DataLoader errors
+        test_loader_iter = iter(test_loader)
+        while True:
+            try:
+                # Try to get the next batch from the DataLoader
+                batch = next(test_loader_iter)
+            except StopIteration:
+                # End of dataset
+                break
+            except (UnicodeDecodeError, RuntimeError, Exception) as e:
+                # Skip batches that fail to load due to data corruption or other issues
+                skipped_batches += 1
+                log.warning(
+                    f"Skipping batch due to DataLoader error for task {task_name}: {e}"
+                )
+                continue
+
+            # Update progress bar
+            pbar.update(1)
+
+            # Validate the batch before processing
+            if not self._validate_batch(batch, task_name):
+                skipped_batches += 1
+                log.warning(
+                    f"Skipping invalid batch {skipped_batches} for task {task_name}"
+                )
+                continue
+
+            try:
+                inputs, targets = batch
+                outputs = classifier(
+                    inputs,
+                    return_image_embeds=True,
+                    return_dict=True,
+                    task_name=task_name,
+                )
+                logits: Tensor = outputs["logits"]
+
+                loss = F.cross_entropy(logits, targets)
+                loss_metric.update(loss.detach().cpu())
+                accuracy(logits.detach().cpu(), targets.detach().cpu())
+
+                processed_batches += 1
+                pbar.set_postfix(
+                    {
+                        "accuracy": accuracy.compute().item(),
+                        "loss": loss_metric.compute().item(),
+                        "processed": processed_batches,
+                        "skipped": skipped_batches,
+                    }
+                )
+
+            except Exception as e:
+                log.error(f"Error processing batch for task {task_name}: {e}")
+                skipped_batches += 1
+                continue
+
+        # Log summary of batch processing
+        total_batches = processed_batches + skipped_batches
+        if total_batches > 0:
+            log.info(
+                f"Task {task_name}: Processed {processed_batches}/{total_batches} batches, skipped {skipped_batches}"
             )
+
+        # Only compute metrics if we processed at least one batch
+        if processed_batches == 0:
+            log.warning(f"No valid batches processed for task {task_name}")
+            return {
+                "accuracy": 0.0,
+                "loss": float("inf"),
+                "processed_batches": 0,
+                "skipped_batches": skipped_batches,
+            }
 
         acc = accuracy.compute().item()
         loss = loss_metric.compute().item()
-        results = {"accuracy": acc, "loss": loss}
+        results = {
+            "accuracy": acc,
+            "loss": loss,
+            "processed_batches": processed_batches,
+            "skipped_batches": skipped_batches,
+        }
         return results
 
     def evaluate(

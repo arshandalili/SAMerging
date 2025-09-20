@@ -59,6 +59,36 @@ train_datasets:
     name: sst2
     split: train
 
+test_datasets:
+  cola:
+    _target_: ${..._dataset_loader}
+    name: cola
+    split: validation
+  mnli:
+    _target_: ${..._dataset_loader}
+    name: mnli
+    split: validation_matched
+  mrpc:
+    _target_: ${..._dataset_loader}
+    name: mrpc
+    split: validation
+  qnli:
+    _target_: ${..._dataset_loader}
+    name: qnli
+    split: validation
+  qqp:
+    _target_: ${..._dataset_loader}
+    name: qqp
+    split: validation
+  rte:
+    _target_: ${..._dataset_loader}
+    name: rte
+    split: validation
+  sst2:
+    _target_: ${..._dataset_loader}
+    name: sst2
+    split: validation
+
 tokenizer:
   _target_: fusion_bench.modelpool.huggingface_gpt2_classification.load_gpt2_tokenizer
   pretrained_model_name_or_path: gpt2

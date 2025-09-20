@@ -21,8 +21,9 @@ from fusion_bench.models.wrappers.layer_wise_fusion import (
 from fusion_bench.utils.data import load_tensor_from_file
 from fusion_bench.utils.type import TorchModelType
 
-from .entropy_loss import entropy_loss
-from .utils import get_memory_usage
+from .losses import compute_kl_loss, compute_jsd_loss, compute_ce_loss, entropy_loss
+from .utils import get_memory_usage, SAM
+from .fsam import FisherSAM
 
 if TYPE_CHECKING:
     from fusion_bench.programs.fabric_fusion_program import FabricModelFusionProgram
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class LayerWiseAdaMergingAlgorithm(
+class LayerWiseSAMergingAlgorithm(
     ModelFusionAlgorithm,
     LightningFabricMixin,
     SimpleProfilerMixin,
@@ -39,7 +40,7 @@ class LayerWiseAdaMergingAlgorithm(
     """The program that this algorithm is running on."""
 
     """
-    Implements the Layer-Wise AdaMerging Algorithm.
+    Implements the Layer-Wise SAMerging Algorithm.
 
     This class merges the layers of a pretrained model with those of several fine-tuned models.
     The merging is controlled by layer-wise weights, which can be initialized based on a provided configuration or loaded from a file.
@@ -47,7 +48,7 @@ class LayerWiseAdaMergingAlgorithm(
 
     def __init__(self, algorithm_config: DictConfig):
         """
-        Initialize the LayerWiseAdaMergingAlgorithm with the given configuration.
+        Initialize the LayerWiseSAMergingAlgorithm with the given configuration.
 
         Args:
             algorithm_config (DictConfig): The configuration for the algorithm.
@@ -99,6 +100,7 @@ class LayerWiseAdaMergingAlgorithm(
             clamp_weights=self.config.clamp_weights,
             tie_weights=self.config.tie_weights,
             strict=self.config.strict,
+            # sparsity_ratio=0.3,
         )
         print(f"{layer_wise_weight.size()=}, {layer_wise_weight.numel()=}")
         return module
@@ -127,7 +129,7 @@ class LayerWiseAdaMergingAlgorithm(
 
     def run(self, modelpool: ModelPool, **kwargs):
         """
-        Run the Layer-Wise AdaMerging Algorithm.
+        Run the Layer-Wise SAMerging Algorithm.
 
         This method constructs the wrapped model and performs test-time adaptation if necessary.
 
@@ -137,7 +139,7 @@ class LayerWiseAdaMergingAlgorithm(
         Returns:
             LayerWiseMergedModel: The merged model after test-time adaptation.
         """
-        log.info("Fusing models using layer-wise adaptive merging.")
+        log.info("Fusing models using layer-wise adaptive samerging.")
         self.modelpool = modelpool
         self.log_hyperparams(self.config)
 
@@ -146,7 +148,12 @@ class LayerWiseAdaMergingAlgorithm(
 
         if self.config.weights is not None:
             # skip the test-time adaptation
-            return module.merge_and_unload()
+            merged_model = module.merge_and_unload()
+            torch.save(
+                merged_model.state_dict(),
+                "/data/arshan/permutation_fisher/models/samerging_rho_05_500.pth",
+            )
+            return merged_model
         else:
             with self.profile("test-time adaptation"):
                 module = self.test_time_adaptation(module)
@@ -154,7 +161,12 @@ class LayerWiseAdaMergingAlgorithm(
                 self.save_merging_weights(
                     self.config.save_merging_weights, module.merge_weight
                 )
-            return module.merge_and_unload()
+            merged_model = module.merge_and_unload()
+            # torch.save(
+            #     merged_model.state_dict(),
+            #     "/data/arshan/permutation_fisher/models/adamerging_rho_05_500.pth",
+            # )
+            return merged_model
 
     def on_test_time_adaptation_start(self):
         """
@@ -190,6 +202,88 @@ class LayerWiseAdaMergingAlgorithm(
         """
         pass
 
+    def _sam_optimizer_step(self, module, optimizer, batches, expert_logits_dict):
+        """
+        Perform a single step of SAM optimization.
+
+        Args:
+            module: The model module to optimize
+            optimizer: The SAM optimizer instance
+            batches: Dictionary of batches for each task
+            expert_logits_dict: Dictionary of pre-computed expert logits for each task
+
+        Returns:
+            float: The total loss value
+        """
+
+        optimizer.zero_grad()
+
+        for task in self.modelpool.model_names:
+            logits = self.compute_logits(
+                module, batches[task].to(self.fabric.device), task
+            )
+            loss = compute_kl_loss(logits, expert_logits_dict[task].to(self.fabric.device))
+            # loss = entropy_loss(logits)
+            self.fabric.backward(loss, retain_graph=True)
+
+        optimizer.first_step(zero_grad=True)
+
+        for task in self.modelpool.model_names:
+            logits = self.compute_logits(
+                module, batches[task].to(self.fabric.device), task
+            )
+            loss = compute_kl_loss(logits, expert_logits_dict[task].to(self.fabric.device))
+            # loss = entropy_loss(logits)
+            self.fabric.backward(loss, retain_graph=True)
+
+        optimizer.second_step(zero_grad=True)
+
+        return loss
+
+    def _precompute_expert_logits_and_batches(self, expert_models, num_steps, precompute_steps=500):
+        """
+        Pre-compute expert logits for all tasks and steps to avoid redundant computation.
+        Only computes first precompute_steps steps and cycles through them for remaining steps.
+
+        Args:
+            expert_models: Dictionary of expert models for each task
+            num_steps: Number of optimization steps
+
+        Returns:
+            tuple: (all_batches, all_expert_logits) where each is a list of dictionaries
+        """
+        # Only pre-compute first 500 steps, then cycle through them
+        precompute_steps = min(precompute_steps, num_steps)
+        log.info(
+            f"Pre-computing expert logits for first {precompute_steps} steps (will cycle for {num_steps} total steps)..."
+        )
+
+        all_batches = []
+        all_expert_logits = []
+
+        for step_idx in tqdm(
+            range(precompute_steps),
+            desc="Pre-computing expert logits",
+            dynamic_ncols=True,
+        ):
+            step_batches = {}
+            step_expert_logits = {}
+
+            for task in self.modelpool.model_names:
+                batch = next(self.get_shuffled_test_loader_iter(task))
+                step_batches[task] = batch[0].clone().detach().cpu()
+
+                with torch.no_grad():
+                    expert_logits = self.compute_logits(
+                        expert_models[task], batch[0], task
+                    )
+                    step_expert_logits[task] = expert_logits.detach().cpu()
+
+            all_batches.append(step_batches)
+            all_expert_logits.append(step_expert_logits)
+
+        return all_batches, all_expert_logits
+
     def test_time_adaptation(self, module: "LayerWiseMergedModel[TorchModelType]"):
         """
         Perform test-time adaptation on the merged model.
@@ -209,37 +303,80 @@ class LayerWiseAdaMergingAlgorithm(
             optimizer = torch.optim.Adam([module.merge_weight], lr=self.config.lr)
             print(f"{optimizer=}")
             module, optimizer = self.fabric.setup(module, optimizer)
+        elif self.config.optimizer == "sam":
+            base_optimizer = torch.optim.SGD
+            lambda_params = [module.merge_weight]
+            other_params = [
+                p for p in module.task_vectors.parameters() if p.requires_grad
+            ]
+
+            optim_groups = [
+                dict(params=lambda_params, lr=self.config.lr),
+                dict(params=other_params, lr=0.0),
+            ]
+            optimizer = SAM(
+                optim_groups,
+                base_optimizer,
+                lr=self.config.lr,
+                rho=self.config.rho,
+                adaptive=True,
+                momentum=0.99,
+                weight_decay=5e-4,
+            )
+            print(f"{optimizer=}")
+            module, optimizer = self.fabric.setup(module, optimizer)
         else:
             raise ValueError(f"Unsupported optimizer: {self.config.optimizer}")
 
         module.train()
         module.merge_weights()
+
+        expert_models = {}
+        for task in self.modelpool.model_names:
+            expert_models[task] = self.modelpool.load_model(task).to(self.fabric.device)
+
+        # Pre-compute expert logits and batches for all steps
+        num_steps = self.config.max_steps if not self.is_debug_mode else 1
+        with self.profile("pre-computing expert logits"):
+            all_batches, all_expert_logits = self._precompute_expert_logits_and_batches(
+                expert_models, num_steps, precompute_steps=self.config.precompute_steps
+            )
+
+        del expert_models
+        torch.cuda.empty_cache()
+
+        num_steps = self.config.max_steps if not self.is_debug_mode else 1
         for step_idx in (
             pbar := tqdm(
-                range(self.config.max_steps if not self.is_debug_mode else 1),
+                range(num_steps),
                 ("[DEBUG MODE] " if self.is_debug_mode else "")
-                + "AdaMerging Test-time adaptation",
+                + "SAMerging Test-time adaptation",
                 dynamic_ncols=True,
             )
         ):
-            # default behavior for first-order optimizers
-            for task in self.modelpool.model_names:
-                with self.profile("data loading"):
-                    try:
-                        batch = next(self.get_shuffled_test_loader_iter(task))
-                    except Exception as e:
-                        log.error(f"Error in data loading for task {task}, skipping...")
-                        log.error(e)
-                        break
-                with self.profile("forward pass"):
-                    logits = self.compute_logits(module, batch[0], task)
-                    loss = entropy_loss(logits)
-                with self.profile("backward pass"):
-                    self.fabric.backward(loss, retain_graph=True)
+            # Use pre-computed batches and expert logits for this step
+            batches = all_batches[step_idx % len(all_batches)]
+            expert_logits_dict = all_expert_logits[step_idx % len(all_expert_logits)]
 
             with self.profile("optimizer step"):
-                optimizer.step()
-                optimizer.zero_grad()
+                if self.config.optimizer == "sam":
+                    loss = self._sam_optimizer_step(
+                        module, optimizer, batches, expert_logits_dict
+                    )
+                else:
+                    for task in self.modelpool.model_names:
+                        with self.profile("forward pass"):
+                            logits = self.compute_logits(
+                                module, batches[task].to(self.fabric.device), task
+                            )
+                            loss = compute_kl_loss(
+                                logits, expert_logits_dict[task].to(self.fabric.device)
+                            )
+                        with self.profile("backward pass"):
+                            self.fabric.backward(loss, retain_graph=True)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
             with self.profile("merging weights"):
                 module.merge_weights()
 
@@ -249,9 +386,10 @@ class LayerWiseAdaMergingAlgorithm(
                 "train/weight_min": module.merge_weight.min().item(),
                 "train/weight_mean": module.merge_weight.mean().item(),
             }
+
             self.fabric.log_dict(metrics, step=step_idx)
             pbar.set_postfix(metrics)
 
-        log.info(get_memory_usage(f"after adamerging, the memory usage of GPU is:"))
+        log.info(get_memory_usage(f"after samerging, the memory usage of GPU is:"))
         self.print_profile_summary()
         return module

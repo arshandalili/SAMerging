@@ -7,5 +7,5 @@ weight_transpose: true
 # float, reduce non-diagonal elements in regmean weights by multiplying this scalar
 reduce_non_diagonal_ratio: 0.6
 dataloader_kwargs:
-  batch_size: 32
+  batch_size: 16
   num_workers: 0

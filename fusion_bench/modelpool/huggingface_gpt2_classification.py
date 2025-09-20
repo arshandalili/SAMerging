@@ -48,14 +48,14 @@ class GPT2ForSequenceClassificationPool(BaseModelPool):
         self.tokenizer = tokenizer = instantiate(self._tokenizer)
 
     def load_classifier(
-        self, model_config: str | DictConfig
+        self, model_config: str | DictConfig, *args, **kwargs
     ) -> GPT2ForSequenceClassification:
         if isinstance(model_config, str):
             model_config = self.get_model_config(model_config, return_copy=True)
         model_config._target_ = (
             "transformers.GPT2ForSequenceClassification.from_pretrained"
         )
-        model = instantiate(model_config)
+        model = instantiate(model_config, *args, **kwargs)
         return model
 
 

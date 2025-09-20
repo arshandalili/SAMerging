@@ -9,19 +9,26 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class InfiniteDataLoader:
-    def __init__(self, data_loader: DataLoader):
+    def __init__(self, data_loader: DataLoader, max_steps: Optional[int] = None):
         self.data_loader = data_loader
         self.data_iter = iter(data_loader)
+        self.max_steps = max_steps
+        self.step_count = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if self.max_steps is not None and self.step_count >= self.max_steps:
+            self.step_count = 0
+            self.data_iter = iter(self.data_loader)
         try:
             data = next(self.data_iter)
+            self.step_count += 1
         except StopIteration:
             self.data_iter = iter(self.data_loader)  # Reset the data loader
             data = next(self.data_iter)
+            self.step_count = 0
         return data
 
 

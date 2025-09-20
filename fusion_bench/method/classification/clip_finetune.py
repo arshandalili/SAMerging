@@ -160,8 +160,12 @@ class ImageClassificationFineTuningForCLIP(
             loss = 0
             for task, loader in zip(task_names, train_dataloader_iters):
                 with self.profile("data loading"):
-                    batch = next(loader)
-                    images, labels = batch
+                    try:
+                        batch = next(loader)
+                        images, labels = batch
+                    except Exception as e:
+                        print(f"Error loading batch for task {task}: {e}")
+                        continue
                 with self.profile("forward"):
                     classifier.zeroshot_weights = self.zeroshot_weights[task]
                     logits = classifier(images)
