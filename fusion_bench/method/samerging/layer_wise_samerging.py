@@ -40,7 +40,6 @@ from fusion_bench.utils.type import TorchModelType
 
 from .losses import compute_kl_loss
 from .utils import get_memory_usage, SAM
-from .fsam import FisherSAM
 
 if TYPE_CHECKING:
     from fusion_bench.programs.fabric_fusion_program import FabricModelFusionProgram
