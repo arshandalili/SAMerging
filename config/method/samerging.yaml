@@ -5,11 +5,14 @@ name: ???
 weights: null # 1195 is the best
 # learning rate
 optimizer: sam
+base_optimizer: adam
 lr: 1e-3
 momentum: 0.99
 weight_decay: 5e-4
 init_values: 0.0
 rho: 0.07
+objective: kl
+temperature: 2.0
 # if `clamp_weights` is true, the weights will be clamped to [0, 1]
 clamp_weights: false
 # arguments of `functional_call`

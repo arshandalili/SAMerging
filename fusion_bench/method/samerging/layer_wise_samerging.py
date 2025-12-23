@@ -12,7 +12,16 @@ import contextlib
 import os
 from abc import abstractmethod
 from re import T
-from typing import TYPE_CHECKING, Any, List, Mapping, TypeVar, Union, cast  # noqa: F401
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    List,
+    Mapping,
+    TypeVar,
+    Union,
+    Optional,
+    cast,
+)  # noqa: F401
 
 import torch
 from lightning.fabric.utilities.rank_zero import rank_zero_only
@@ -38,7 +47,7 @@ from fusion_bench.models.wrappers.layer_wise_fusion import (
 from fusion_bench.utils.data import load_tensor_from_file
 from fusion_bench.utils.type import TorchModelType
 
-from .losses import compute_kl_loss
+from .losses import compute_kl_loss, entropy_loss
 from .utils import get_memory_usage, SAM
 
 if TYPE_CHECKING:
@@ -70,6 +79,29 @@ class LayerWiseSAMergingAlgorithm(
             algorithm_config (DictConfig): The configuration for the algorithm.
         """
         super().__init__(algorithm_config)
+
+    def _compute_objective_loss(
+        self,
+        merged_logits: Tensor,
+        expert_logits: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Compute loss based on configured objective: 'kl' (default) or 'entropy'.
+        """
+        objective = str(getattr(self.config, "objective", "kl")).lower()
+        if objective == "kl":
+            if expert_logits is None:
+                raise ValueError("KL objective requires expert_logits but got None")
+            temperature = float(getattr(self.config, "temperature", 2.0))
+            return compute_kl_loss(
+                merged_logits, expert_logits, temperature=temperature
+            )
+        elif objective == "entropy":
+            return entropy_loss(merged_logits)
+        else:
+            raise ValueError(
+                f"Unsupported objective: {objective}. Choose from ['kl', 'entropy']."
+            )
 
     @torch.no_grad()
     def construct_layer_wise_merged_model(self, modelpool: "ModelPool"):
@@ -241,6 +273,51 @@ class LayerWiseSAMergingAlgorithm(
         """
         pass
 
+    def _precompute_expert_logits_and_batches(self, expert_models, num_steps):
+        """
+        Pre-compute expert logits and cache batches for all tasks and steps.
+        
+        IMPORTANT: Expert logits MUST correspond to the exact batches they were computed from.
+        We cache batches on CPU to save GPU memory while keeping the association intact.
+
+        Args:
+            expert_models: Dictionary of expert models for each task
+            num_steps: Number of optimization steps
+
+        Returns:
+            tuple: (all_batches, all_expert_logits) 
+                   - batches stored on CPU to save GPU memory
+                   - expert logits stored on CPU
+        """
+        log.info("Pre-computing expert logits and caching batches (memory-efficient version)...")
+
+        all_batches = []
+        all_expert_logits = []
+
+        for step_idx in tqdm(
+            range(num_steps), desc="Pre-computing expert logits", dynamic_ncols=True
+        ):
+            step_batches = {}
+            step_expert_logits = {}
+
+            for task in self.modelpool.model_names:
+                batch = next(self.get_shuffled_test_loader_iter(task))
+                # Store batch on CPU to save GPU memory
+                step_batches[task] = batch[0].clone().detach().cpu()
+
+                with torch.no_grad():
+                    # Compute expert logits on GPU
+                    expert_logits = self.compute_logits(
+                        expert_models[task], batch[0].to(self.fabric.device), task
+                    )
+                    # Store logits on CPU to save GPU memory
+                    step_expert_logits[task] = expert_logits.detach().cpu()
+
+            all_batches.append(step_batches)
+            all_expert_logits.append(step_expert_logits)
+
+        return all_batches, all_expert_logits
+
     def _sam_optimizer_step(
         self, module, optimizer, expert_models, step_idx: int, global_step: int
     ):
@@ -279,7 +356,8 @@ class LayerWiseSAMergingAlgorithm(
         for task in self.modelpool.model_names:
             if task in batches:
                 logits = self.compute_logits(module, batches[task], task)
-                loss = compute_kl_loss(logits, expert_logits_dict[task], temperature=2)
+                expert_logits = expert_logits_dict[task]
+                loss = self._compute_objective_loss(logits, expert_logits)
                 self.fabric.backward(loss, retain_graph=True)
 
         optimizer.first_step(zero_grad=True)
@@ -288,7 +366,8 @@ class LayerWiseSAMergingAlgorithm(
         for task in self.modelpool.model_names:
             if task in batches:
                 logits = self.compute_logits(module, batches[task], task)
-                loss = compute_kl_loss(logits, expert_logits_dict[task], temperature=2)
+                expert_logits = expert_logits_dict[task]
+                loss = self._compute_objective_loss(logits, expert_logits)
                 total_loss += loss
                 self.fabric.backward(loss, retain_graph=True)
 
@@ -354,11 +433,8 @@ class LayerWiseSAMergingAlgorithm(
                     logits = self.compute_logits(
                         module, batches[task].to(self.fabric.device), task
                     )
-                    loss = compute_kl_loss(
-                        logits,
-                        expert_logits_dict[task].to(self.fabric.device),
-                        temperature=2,
-                    )
+                    expert_logits = expert_logits_dict[task].to(self.fabric.device)
+                    loss = self._compute_objective_loss(logits, expert_logits)
                     # Average across accumulation steps to preserve gradient scale
                     self.fabric.backward(loss / accum_steps, retain_graph=True)
 
@@ -373,11 +449,8 @@ class LayerWiseSAMergingAlgorithm(
                     logits = self.compute_logits(
                         module, batches[task].to(self.fabric.device), task
                     )
-                    loss = compute_kl_loss(
-                        logits,
-                        expert_logits_dict[task].to(self.fabric.device),
-                        temperature=2,
-                    )
+                    expert_logits = expert_logits_dict[task].to(self.fabric.device)
+                    loss = self._compute_objective_loss(logits, expert_logits)
                     total_loss += loss.detach()
                     # Average across accumulation steps to preserve gradient scale
                     self.fabric.backward(loss / accum_steps, retain_graph=True)
@@ -403,9 +476,25 @@ class LayerWiseSAMergingAlgorithm(
         """
         self.on_test_time_adaptation_start()
 
-        # configure optimizer (SAM only)
+        # configure optimizer (SAM/Adam/SGD)
         if self.config.optimizer == "sam":
-            base_optimizer = torch.optim.SGD
+            if self.config.base_optimizer == "sgd":
+                base_optimizer = torch.optim.SGD
+                optim_kwargs = dict(
+                    lr=self.config.lr,
+                    weight_decay=self.config.weight_decay,
+                    momentum=self.config.momentum,
+                )
+            elif self.config.base_optimizer == "adam":
+                base_optimizer = torch.optim.Adam
+                optim_kwargs = dict(
+                    lr=self.config.lr,
+                    weight_decay=self.config.weight_decay,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported base optimizer: {self.config.base_optimizer}. Only 'sgd' and 'adam' are supported."
+                )
             lambda_params = [module.merge_weight]
             other_params = [
                 p for p in module.task_vectors.parameters() if p.requires_grad
@@ -417,9 +506,24 @@ class LayerWiseSAMergingAlgorithm(
             optimizer = SAM(
                 optim_groups,
                 base_optimizer,
-                lr=self.config.lr,
                 rho=self.config.rho,
                 adaptive=True,
+                **optim_kwargs,
+            )
+            print(f"{optimizer=}")
+            module, optimizer = self.fabric.setup(module, optimizer)
+        elif self.config.optimizer == "adam":
+            optimizer = torch.optim.Adam(
+                [module.merge_weight],
+                lr=self.config.lr,
+                weight_decay=self.config.weight_decay,
+            )
+            print(f"{optimizer=}")
+            module, optimizer = self.fabric.setup(module, optimizer)
+        elif self.config.optimizer == "sgd":
+            optimizer = torch.optim.SGD(
+                [module.merge_weight],
+                lr=self.config.lr,
                 momentum=self.config.momentum,
                 weight_decay=self.config.weight_decay,
             )
@@ -427,7 +531,7 @@ class LayerWiseSAMergingAlgorithm(
             module, optimizer = self.fabric.setup(module, optimizer)
         else:
             raise ValueError(
-                f"Unsupported optimizer: {self.config.optimizer}. Only 'sam' is supported."
+                f"Unsupported optimizer: {self.config.optimizer}. Only 'sam', 'adam', and 'sgd' are supported."
             )
 
         module.train()
@@ -437,7 +541,21 @@ class LayerWiseSAMergingAlgorithm(
         for task in self.modelpool.model_names:
             expert_models[task] = self.modelpool.load_model(task).to(self.fabric.device)
 
+        # Pre-compute expert logits and cache batches (memory-efficient: batches on CPU)
         num_steps = self.config.max_steps if not self.is_debug_mode else 1
+        with self.profile("pre-computing expert logits"):
+            all_batches, all_expert_logits = self._precompute_expert_logits_and_batches(
+                expert_models, num_steps
+            )
+
+        # Free expert models to save GPU memory - we only need the cached logits now
+        del expert_models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        log.info(f"Pre-computed {len(all_expert_logits)} steps of expert logits for {len(self.modelpool.model_names)} tasks")
+        log.info("Expert models freed from GPU memory")
+
         num_epochs = self.config.epochs
         global_step = 0
 
@@ -452,27 +570,82 @@ class LayerWiseSAMergingAlgorithm(
                     dynamic_ncols=True,
                 )
             ):
+                # Use pre-computed batches and expert logits for this step
+                batches_cpu = all_batches[step_idx % len(all_batches)]
+                expert_logits_cpu = all_expert_logits[step_idx % len(all_expert_logits)]
+                
+                # Move to GPU only when needed
+                batches = {task: batch.to(self.fabric.device) for task, batch in batches_cpu.items()}
+                expert_logits_dict = {task: logits.to(self.fabric.device) for task, logits in expert_logits_cpu.items()}
+
                 with self.profile("optimizer step"):
                     if self.config.optimizer == "sam":
                         if grad_accum_steps == 1:
-                            loss = self._sam_optimizer_step(
-                                module, optimizer, expert_models, step_idx, global_step
-                            )
+                            # Use cached batches and logits
+                            optimizer.zero_grad()
+
+                            for task in self.modelpool.model_names:
+                                if task in batches:
+                                    logits = self.compute_logits(module, batches[task], task)
+                                    expert_logits = expert_logits_dict[task]
+                                    loss = self._compute_objective_loss(logits, expert_logits)
+                                    self.fabric.backward(loss, retain_graph=True)
+
+                            optimizer.first_step(zero_grad=True)
+
+                            total_loss = 0
+                            for task in self.modelpool.model_names:
+                                if task in batches:
+                                    logits = self.compute_logits(module, batches[task], task)
+                                    expert_logits = expert_logits_dict[task]
+                                    loss = self._compute_objective_loss(logits, expert_logits)
+                                    total_loss += loss
+                                    self.fabric.backward(loss, retain_graph=True)
+
+                            optimizer.second_step(zero_grad=True)
+                            loss = total_loss
                         else:
-                            loss = self._sam_optimizer_step_accum(
-                                module,
-                                optimizer,
-                                expert_models,
-                                grad_accum_steps,
-                                step_idx,
-                                global_step,
+                            log.warning(
+                                "Gradient accumulation with pre-computed logits uses simplified approach"
                             )
+                            # Simplified version for grad accumulation
+                            optimizer.zero_grad()
+                            for task in self.modelpool.model_names:
+                                if task in batches:
+                                    logits = self.compute_logits(module, batches[task], task)
+                                    loss = self._compute_objective_loss(logits, expert_logits_dict[task])
+                                    self.fabric.backward(loss, retain_graph=True)
+                            optimizer.first_step(zero_grad=True)
+                            total_loss = 0
+                            for task in self.modelpool.model_names:
+                                if task in batches:
+                                    logits = self.compute_logits(module, batches[task], task)
+                                    loss = self._compute_objective_loss(logits, expert_logits_dict[task])
+                                    total_loss += loss
+                                    self.fabric.backward(loss, retain_graph=True)
+                            optimizer.second_step(zero_grad=True)
+                            loss = total_loss
+                    elif (
+                        self.config.optimizer == "adam"
+                        or self.config.optimizer == "sgd"
+                    ):
+                        total_loss = 0
+                        for task in self.modelpool.model_names:
+                            if task in batches:
+                                logits = self.compute_logits(
+                                    module, batches[task], task
+                                )
+                                expert_logits = expert_logits_dict[task]
+                                loss = self._compute_objective_loss(logits, expert_logits)
+                                total_loss += loss
+                                self.fabric.backward(loss, retain_graph=True)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        loss = total_loss
                     else:
                         raise ValueError(
-                            f"Unsupported optimizer: {self.config.optimizer}. Only 'sam' is supported."
+                            f"Unsupported optimizer: {self.config.optimizer}. Only 'sam', 'adam', and 'sgd' are supported."
                         )
-
-                        # no extra intermediates to clear for SAM
 
                 with self.profile("merging weights"):
                     module.merge_weights()

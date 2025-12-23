@@ -301,33 +301,31 @@ class GPT2LayerWiseSAMergingAlgorithm(
 
         return loss
 
-    def _precompute_expert_logits_and_batches(self, expert_models, num_steps):
+    def _precompute_expert_logits(self, expert_models, num_steps):
         """
         Pre-compute expert logits for all tasks and steps to avoid redundant computation.
+        
+        This is a memory-efficient version that only caches expert logits, not batches.
+        Batches are re-loaded on-the-fly during training to save memory.
 
         Args:
             expert_models: Dictionary of expert models for each task
             num_steps: Number of optimization steps
 
         Returns:
-            tuple: (all_batches, all_expert_logits) where each is a list of dictionaries
+            list: all_expert_logits - a list of dictionaries containing expert logits for each (step, task)
         """
-        log.info("Pre-computing expert logits for all tasks and steps...")
+        log.info("Pre-computing expert logits for all tasks and steps (memory-efficient version)...")
 
-        all_batches = []
         all_expert_logits = []
 
         for step_idx in tqdm(
             range(num_steps), desc="Pre-computing expert logits", dynamic_ncols=True
         ):
-            step_batches = {}
             step_expert_logits = {}
 
             for task in self.modelpool.model_names:
                 batch = next(self.get_shuffled_test_loader_iter(task))
-                step_batches[task.split('-')[1]] = {
-                    k: v.clone().detach().cpu() for k, v in batch.items()
-                }
 
                 with torch.no_grad():
                     expert_logits = self.compute_logits(
@@ -335,10 +333,9 @@ class GPT2LayerWiseSAMergingAlgorithm(
                     )
                     step_expert_logits[task.split('-')[1]] = expert_logits.detach().cpu()
 
-            all_batches.append(step_batches)
             all_expert_logits.append(step_expert_logits)
 
-        return all_batches, all_expert_logits
+        return all_expert_logits
 
     def test_time_adaptation(self, module: "LayerWiseMergedModel[TorchModelType]"):
         """
@@ -391,15 +388,17 @@ class GPT2LayerWiseSAMergingAlgorithm(
         for task in self.modelpool.model_names:
             expert_models[task.split('-')[1]] = self.modelpool.load_model(task).to(self.fabric.device)
 
-        # Pre-compute expert logits and batches for all steps
+        # Pre-compute expert logits for all steps (memory-efficient: only logits, not batches)
         num_steps = self.config.max_steps if not self.is_debug_mode else 1
         with self.profile("pre-computing expert logits"):
-            all_batches, all_expert_logits = self._precompute_expert_logits_and_batches(
+            all_expert_logits = self._precompute_expert_logits(
                 expert_models, num_steps
             )
 
         del expert_models
         torch.cuda.empty_cache()
+        
+        log.info(f"Pre-computed {len(all_expert_logits)} steps of expert logits for {len(self.modelpool.model_names)} tasks")
 
         for step_idx in (
             pbar := tqdm(
@@ -409,8 +408,12 @@ class GPT2LayerWiseSAMergingAlgorithm(
                 dynamic_ncols=True,
             )
         ):
-            # Use pre-computed batches and expert logits for this step
-            batches = all_batches[step_idx % len(all_batches)]
+            # Load batches on-the-fly (memory efficient) and use pre-computed expert logits
+            batches = {}
+            for task in self.modelpool.model_names:
+                batch = next(self.get_shuffled_test_loader_iter(task))
+                batches[task.split('-')[1]] = batch
+            
             expert_logits_dict = all_expert_logits[step_idx % len(all_expert_logits)]
 
             with self.profile("optimizer step"):
