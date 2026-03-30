@@ -148,10 +148,6 @@ class TaskWiseSAMergingAlgorithm(
         if self.config.weights is not None:
             # skip the test-time adaptation
             merged_model = module.merge_and_unload()
-            torch.save(
-                merged_model.state_dict(),
-                "/data/arshan/permutation_fisher/models/sam_merging_task_wise.pth",
-            )
             return merged_model
         else:
             with self.profile("test-time adaptation"):
